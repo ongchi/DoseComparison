@@ -4,7 +4,7 @@ DoseComparison
     numerical evaluation of dose distributions comparison
 
 :Date: 2016-11-06
-:Version: 0.0.1
+:Version: 0.0.2
 :Author: ongchi
 :Copyright: Copyright (c) 2016, ongchi
 :License: BSD 3-Clause License
@@ -26,10 +26,15 @@ def gamma_index(refimg, tstimg, dta=1, dd=0.05):
     :type dd: float
     :rtype: numpy.ndarray
     '''
-    diff = tstimg - refimg
+    # check for valid arguments
+    if refimg.shape != tstimg.shape:
+        raise Exception("ValueError: shape mismatch: refimg and tstimg must have the same shape")
+    if dta <= 0 or int(dta) != dta:
+        raise Exception("ValueError: dta is an integer greater than zero")
+    if dd <= 0 or dd >= 1:
+        raise Exception("ValueError: dd is a float number between 0 (exclusive) and 1 (exclusive)")
 
-    if dta == 0:
-        return diff, diff
+    diff = tstimg - refimg
 
     gamma = np.ma.empty_like(diff)
     gamma[:] = np.inf
