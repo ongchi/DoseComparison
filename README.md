@@ -3,7 +3,7 @@ Radiotherapy dose distributions comparison by gamma index and normalized dose di
 
 See example.ipynb for example usage.
 
-# Relative Projects
+# See Also
 - [MATLAB version](https://gist.github.com/ongchi/7482850)
 - [christopherpoole/pygamma](https://github.com/christopherpoole/pygamma)
 - [janpipek/gamma_index](https://github.com/janpipek/gamma_index)

@@ -1,114 +1,184 @@
 #!/usr/bin/env python
+# -*- coding: utf-8 -*-
 '''
 DoseComparison
     numerical evaluation of dose distributions comparison
 
 :Date: 2017-01-02
-:Version: 1.0.0
+:Version: 2.0.0
 :Author: ongchi
 :Copyright: Copyright (c) 2016, ongchi
 :License: BSD 3-Clause License
 '''
+
+from collections import namedtuple
+
 import numpy as np
+from scipy.interpolate import RegularGridInterpolator
+
+VolumeImage = namedtuple('VolumeImage', 'x y z v')
 
 
-def DoseComparison(refimg, tstimg, delta_r=1, delta_d=0.05):
-    ''' gamma evaluation and normalized dose difference of dose image distributions
-
-    :param refimg: reference dose image
-    :param tstimg: test dose image
-    :param delta_r: spatial criterion (voxels)
-    :param delta_d: dose criterion (percentage)
-
-    :type refimg: numpy.ndarray
-    :type tstimg: numpy.ndarray
-    :type delta_r: int
-    :type delta_d: float
-    :rtype: numpy.ndarray, numpy.ndarray
+class DoseComparison(object):
+    ''' Radiation Dose Distribution Comparisons
     '''
-    # check for valid arguments
-    if refimg.shape != tstimg.shape:
-        raise Exception("ValueError: shape mismatch: refimg and tstimg must have the same shape")
-    if delta_r <= 0 or int(delta_r) != delta_r:
-        raise Exception("ValueError: delta_r is an integer greater than zero")
-    if delta_d <= 0 or delta_d >= 1:
-        raise Exception("ValueError: delta_d is a float number between 0 (exclusive) and 1 (exclusive)")
+    def __init__(self, reference, test, delta_d=0.05, delta_r=3):
+        super().__init__()
 
-    diff = tstimg - refimg
+        self._delta_d = delta_d
+        self._delta_r = delta_r
 
-    _ = np.empty(np.array(tstimg.shape) + delta_r * 2)
-    exTest = np.ma.array(_, mask=np.ones_like(_, dtype=bool))
-    _ = slice(delta_r, -delta_r)
-    exTest.data[_, _, _], exTest.mask[_, _, _] = tstimg, False
+        self._voxel_size, self._span, \
+        self._axis, self._ext_axis, \
+        self._grid, self._ext_grid, \
+        self._shape, self._ext_shape = self._prepare_ax_grid(reference, test, delta_r)
 
-    # distance map
-    distRange = np.arange(-delta_r, delta_r + 1, 1, dtype=float)
-    _ = np.array(np.meshgrid(distRange, distRange, distRange))
-    distMap = np.sqrt(np.sum(_ ** 2, axis=0))
+        self._ref, self._test, self._ext_test = self._prepare_volume_data(reference, test)
 
-    # mask out distance map if center of vexel is in delta_r
-    distRange[distRange < 0] += 0.5
-    distRange[distRange > 0] -= 0.5
-    _ = np.array(np.meshgrid(distRange, distRange, distRange))
-    distMask = np.sqrt(np.sum(_ ** 2, axis=0)) >= delta_r
+        self._slab_idx_list = list(map(
 
-    # mask distance within delta_r
-    dist = np.ma.array(distMap, mask=distMask)
-    dist[dist > delta_r] = delta_r
+            lambda f, t: (f, t),
+            range(len(self._test)),
+            range(len(self._ext_test) - len(self._test), len(self._ext_test))
+        ))
+        self._r_list = self._pts_in_delta_r()
 
-    # gamma
-    gamma = np.ma.empty_like(diff)
-    gamma[:] = np.inf
-    _sqDist = (dist / delta_r) ** 2
+        Result = namedtuple('Result', 'isDone value')
+        self._dd = Result(False, np.empty_like(self._ref))
+        self._gamma = Result(False, np.full_like(self._ref, np.inf))
+        self._ndd = Result(False, np.empty_like(self._ref))
 
-    # normalized dose difference
-    madd = np.ma.empty_like(diff)
-    madd[:] = -np.inf
-    l_min_dose = np.ma.empty_like(diff)
-    l_min_dose[:] = np.inf
-    l_min_dist = np.ma.empty_like(diff)
+    def get_gamma(self):
+        if not self._gamma.isDone:
+            for i, _slab in enumerate(self._slab_idx_list):
+                gamma = self._gamma.value[i]
+                for _slice, r in self._r_list:
+                    tmp_gamma = self._gamma_from_r(
+                        r,
+                        self.get_dd()[i],
+                        self._ref[i],
+                        self._ext_test[slice(_slab)][_slice]
+                    )
+                    _gt = gamma > tmp_gamma
+                    gamma[_gt] = tmp_gamma[_gt]
+            self._gamma = self._gamma._replace(isDone=True)
+        return self._gamma.value
 
-    nx, ny, nz = diff.shape
-    it = np.nditer(dist, ("multi_index", ))
-    while not it.finished:
-        i, j, k = idx = it.multi_index
-        _volSlice = [slice(i, i + nx), slice(j, j + ny), slice(k, k + nz)]
+    def get_dd(self):
+        if not self._dd.isDone:
+            self._dd.value[:] = self._test - self._ref
+            self._dd = self._dd._replace(idDone=True)
+        return self._dd.value
 
-        # skip masked voxels
-        if distMask[idx] or np.alltrue(exTest[_volSlice].mask):
-            it.iternext()
-            continue
+    def _prepare_ax_grid(self, r, t, delta_r):
+        min_voxel_size = [
+            np.hstack([np.gradient(r.x), np.gradient(t.x)]).min(),
+            np.hstack([np.gradient(r.y), np.gradient(t.y)]).min(),
+            np.hstack([np.gradient(r.z), np.gradient(t.z)]).min()
+        ]
 
-        # gamma index
-        _sqDose = ((exTest[_volSlice] - refimg) / refimg / delta_d) ** 2
-        _gamma = np.sqrt(_sqDist[idx] + _sqDose)
-        _ = np.bitwise_and(gamma > _gamma, np.bitwise_not(_gamma.mask))
-        gamma[_] = _gamma[_]
+        ax_stack = [np.hstack([r.x, t.x]), np.hstack([r.y, t.y]), np.hstack([r.z, t.z])]
 
-        # madd
-        _ = l_min_dose > exTest[_volSlice]
-        l_min_dose[_] = exTest[_]
-        l_min_dist[_] = dist[idx]
+        left, right = np.array([i.min() for i in ax_stack]), np.array([i.max() for i in ax_stack])
 
-        it.iternext()
+        axis = self._ax_gen(left, right, min_voxel_size)
 
-    # ndd calculation
-    sr = np.sqrt(delta_d ** 2 - (delta_d * l_min_dist / delta_r) ** 2)
-    madd = ( (np.abs(l_min_dose - refimg) / refimg) < sr
-        ) * ( sr - np.abs(l_min_dose - refimg) + delta_d )
-    madd[madd < delta_d] = delta_d
-    ndd = diff / madd * delta_d
+        voxel_size = np.array([i[1] - i[0] for i in axis])
+        ext_scale_factor = np.ceil([delta_r / sz for sz in voxel_size])
+        span = voxel_size * ext_scale_factor
 
-    return gamma, ndd
+        ext_axis = self._ax_gen(left - span, right + span, voxel_size)
 
+        grid = np.array(np.meshgrid(*axis, indexing='ij'))
+        ext_grid = np.array(np.meshgrid(*ext_axis, indexing='ij'))
+        shape = [len(i) for i in axis]
+        ext_shape = [len(i) for i in ext_axis]
+
+        return voxel_size, span, axis, ext_axis, grid, ext_grid, shape, ext_shape
+
+    def _prepare_volume_data(self, r, t):
+        ref_interp_f = self._structured_griddata_interp(r)
+        test_interp_f = self._structured_griddata_interp(t)
+
+        ref = ref_interp_f(self._grid.T.reshape(-1, 3)).reshape(*self._shape)
+        test = test_interp_f(self._grid.T.reshape(-1, 3)).reshape(*self._shape)
+        ext_test = test_interp_f(self._ext_grid.T.reshape(-1, 3)).reshape(*self._ext_shape)
+
+        return ref, test, ext_test
+
+    def _pts_in_delta_r(self):
+        r_map = np.sqrt(np.sum(np.square(np.meshgrid(
+            *self._ax_gen(-self._span, self._span, self._voxel_size),
+            indexing='ij'
+        )), axis=0))
+        r_map[r_map > self._delta_r] = np.nan
+
+        ni, nj, nk = self._shape
+
+        r_list = []
+        iter_r = np.nditer(r_map, ("multi_index", ))
+        while not iter_r.finished:
+            i, j, k = idx = iter_r.multi_index
+            if not np.isnan(r_map[idx]):
+                r_list.append((
+                    [slice(i, i + ni), slice(j, j + nj), slice(k, k + nk)],
+                    r_map[idx]
+                ))
+            iter_r.iternext()
+
+        return r_list
+
+    @staticmethod
+    def _ax_gen(left, right, size):
+        return list(map(
+            lambda l, r, s: np.linspace(l, r, np.ceil((r - l) / s + 1).astype(int)),
+            left, right, size
+        ))
+
+    @staticmethod
+    def _structured_griddata_interp(volume):
+        grid_interp = RegularGridInterpolator(
+            (volume.x, volume.y, volume.z),
+            volume.v,
+            method='linear',
+            bounds_error=False,
+            fill_value=0
+        )
+
+        return grid_interp
+
+    @staticmethod
+    def _shared_array(np_arr):
+        return np.ndarray(np_arr.shape, dtype=np_arr.dtype, buffer=np_arr.data)
+
+    def _gamma_from_r(self, r, dd, ref, test):
+        delta_d, delta_r = self._delta_d, self._delta_r
+        r_sq = (r / delta_r) ** 2
+        d_sq = (dd / ref / delta_d) ** 2
+        return np.sqrt(r_sq + d_sq)
+
+    def _madd_ndd(self, d_min, r_min, dd, ref, test):
+        delta_d, delta_r = self._delta_d, self._delta_r
+        sr = np.sqrt(delta_d ** 2 - (delta_d * r_min / delta_r) ** 2)
+        dd_min_abs = np.abs(d_min - ref)
+        in_sr = ((dd_min_abs / ref) < sr)
+        madd = in_sr * (sr - dd_min_abs + delta_d)
+        madd[madd < delta_d] = delta_d
+        ndd = dd / madd * delta_d
+        return madd, ndd
 
 if __name__ == '__main__':
     def wave(x, y, z, v):
         return np.cos(v * x) + np.cos(v * y) + np.cos(v * z) \
             + 2 * (x ** 2 + y ** 2 + z ** 2)
 
-    X, Y, Z = np.mgrid[-2:2:500j, -2:2:500j, -2:2:5j]
-    img1 = wave(X, Y, Z, 10)
-    img2 = wave(X, Y, Z, 12)
+    x = np.linspace(-2, 2, 5)
+    y = np.linspace(-2, 2, 10)
+    z = np.linspace(-2, 2, 10)
+    mgrid = np.meshgrid(x, y, z, indexing='ij')
 
-    gamma, ndd = DoseComparison(img1, img2, delta_r=2, delta_d=0.1)
+    img1 = VolumeImage(x, y, z, wave(*mgrid, 10))
+    img2 = VolumeImage(x+0.2, y+0.2, z+0.2, wave(*mgrid, 12))
+
+    comp = DoseComparison(img1, img2, delta_r=0.5, delta_d=0.1)
+    comp.get_dd()
