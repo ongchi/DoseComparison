@@ -35,12 +35,6 @@ class DoseComparison(object):
 
         self._ref, self._test, self._ext_test = self._prepare_volume_data(reference, test)
 
-        self._slab_idx_list = list(map(
-
-            lambda f, t: (f, t),
-            range(len(self._test)),
-            range(len(self._ext_test) - len(self._test), len(self._ext_test))
-        ))
         self._r_list = self._pts_in_delta_r()
 
         Result = namedtuple('Result', 'isDone value')
@@ -48,26 +42,41 @@ class DoseComparison(object):
         self._gamma = Result(False, np.full_like(self._ref, np.inf))
         self._ndd = Result(False, np.empty_like(self._ref))
 
+    def get_ndd(self):
+        if not self._ndd.isDone:
+            d_min = np.full_like(self._ref, np.inf)
+            r_min = np.full_like(self._ref, np.inf)
+            for _slice, r in self._r_list:
+                greater_idx = d_min > self._ext_test[_slice]
+                d_min[greater_idx] = self._ext_test[_slice][greater_idx]
+                r_min[greater_idx] = r
+            self._ndd.value[:] = self._ndd_kernel(
+                d_min,
+                r_min,
+                self._dd.value,
+                self._ref
+            )
+            self._ndd = self._ndd._replace(isDone=True)
+        return self._ndd.value
+
     def get_gamma(self):
         if not self._gamma.isDone:
-            for i, _slab in enumerate(self._slab_idx_list):
-                gamma = self._gamma.value[i]
-                for _slice, r in self._r_list:
-                    tmp_gamma = self._gamma_from_r(
-                        r,
-                        self.get_dd()[i],
-                        self._ref[i],
-                        self._ext_test[slice(_slab)][_slice]
-                    )
-                    _gt = gamma > tmp_gamma
-                    gamma[_gt] = tmp_gamma[_gt]
+            gamma = self._gamma.value
+            for _slice, r in self._r_list:
+                tmp_gamma = self._gamma_from_r(
+                    r,
+                    self._ref,
+                    self._ext_test[_slice]
+                )
+                greater_idx = gamma > tmp_gamma
+                gamma[greater_idx] = tmp_gamma[greater_idx]
             self._gamma = self._gamma._replace(isDone=True)
         return self._gamma.value
 
     def get_dd(self):
         if not self._dd.isDone:
             self._dd.value[:] = self._test - self._ref
-            self._dd = self._dd._replace(idDone=True)
+            self._dd = self._dd._replace(isDone=True)
         return self._dd.value
 
     def _prepare_ax_grid(self, r, t, delta_r):
@@ -147,17 +156,15 @@ class DoseComparison(object):
 
         return grid_interp
 
-    @staticmethod
-    def _shared_array(np_arr):
-        return np.ndarray(np_arr.shape, dtype=np_arr.dtype, buffer=np_arr.data)
-
-    def _gamma_from_r(self, r, dd, ref, test):
+    def _gamma_from_r(self, r, ref, test):
         delta_d, delta_r = self._delta_d, self._delta_r
         r_sq = (r / delta_r) ** 2
-        d_sq = (dd / ref / delta_d) ** 2
-        return np.sqrt(r_sq + d_sq)
+        d_sq = ((test - ref) / ref / delta_d) ** 2
+        d_sq[np.isclose(test, ref)] = 0.
+        gamma = np.sqrt(r_sq + d_sq)
+        return gamma
 
-    def _madd_ndd(self, d_min, r_min, dd, ref, test):
+    def _ndd_kernel(self, d_min, r_min, dd, ref):
         delta_d, delta_r = self._delta_d, self._delta_r
         sr = np.sqrt(delta_d ** 2 - (delta_d * r_min / delta_r) ** 2)
         dd_min_abs = np.abs(d_min - ref)
@@ -165,7 +172,7 @@ class DoseComparison(object):
         madd = in_sr * (sr - dd_min_abs + delta_d)
         madd[madd < delta_d] = delta_d
         ndd = dd / madd * delta_d
-        return madd, ndd
+        return ndd
 
 if __name__ == '__main__':
     def wave(x, y, z, v):
@@ -173,12 +180,14 @@ if __name__ == '__main__':
             + 2 * (x ** 2 + y ** 2 + z ** 2)
 
     x = np.linspace(-2, 2, 5)
-    y = np.linspace(-2, 2, 10)
-    z = np.linspace(-2, 2, 10)
+    y = np.linspace(-2, 2, 100)
+    z = np.linspace(-2, 2, 100)
     mgrid = np.meshgrid(x, y, z, indexing='ij')
 
     img1 = VolumeImage(x, y, z, wave(*mgrid, 10))
     img2 = VolumeImage(x+0.2, y+0.2, z+0.2, wave(*mgrid, 12))
 
     comp = DoseComparison(img1, img2, delta_r=0.5, delta_d=0.1)
-    comp.get_dd()
+    dd = comp.get_dd()
+    gamma_index = comp.get_gamma()
+    ndd = comp.get_ndd()
